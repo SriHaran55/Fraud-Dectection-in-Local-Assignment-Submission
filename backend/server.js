@@ -19,14 +19,27 @@ mongoose.connect(process.env.MONGO_URI, {
 .then(() => console.log("✅ MongoDB Connected"))
 .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
+const emailAccounts = [
+    { user: process.env.EMAIL_USER1, pass: process.env.EMAIL_PASS1 },
+    { user: process.env.EMAIL_USER2, pass: process.env.EMAIL_PASS2 },
+    { user: process.env.EMAIL_USER3, pass: process.env.EMAIL_PASS3 }
+];
+
 // Nodemailer Configuration
-const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    }
-});
+const createTransporter = (email, pass) => {
+    return nodemailer.createTransport({
+        host: "smtp.gmail.com",
+        port: 465,
+        secure: true,
+        auth: { user: email, pass: pass }
+    });
+};
+
+const getRandomEmailAccount = () => {
+    return emailAccounts[Math.floor(Math.random() * emailAccounts.length)];
+};
+
+
 
 // User Schema
 const UserSchema = new mongoose.Schema({
@@ -40,12 +53,12 @@ const User = mongoose.model("User", UserSchema);
 // Assignment Schema
 const AssignmentSchema = new mongoose.Schema({
     email: { type: String, required: true },
-    filename: { type: String, required: true },
+    filename: { type: String }, // Optional for file uploads
     uploadTime: { type: Date, default: Date.now },
-    status: { type: String, default: "submitted" }, // submitted, flagged, graded
+    status: { type: String, default: "submitted" },
     fraudScore: { type: Number, default: 0 },
     feedback: { type: String, default: "" },
-    subject: { type: String, required: true } // Add subject field
+    subject: { type: String, required: true } // Ensure subject is required
 });
 const Assignment = mongoose.model("Assignment", AssignmentSchema);
 
@@ -98,25 +111,37 @@ app.post("/login", async (req, res) => {
 
 app.post("/forgot-password", async (req, res) => {
     const { email } = req.body;
-    const user = await User.findOne({ email });
 
-    if (!user) return res.status(400).json({ message: "User not found" });
+    // Normalize the email (trim and lowercase)
+    const normalizedEmail = email.trim().toLowerCase();
 
-    // Generate a random temporary password
+    // Find the user in the database
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+        return res.status(400).json({ message: "User not found" });
+    }
+
+    // Generate a temporary password
     const tempPassword = Math.random().toString(36).slice(-8);
-
-    // Save the temporary password in the database
     user.tempPassword = tempPassword;
     await user.save();
 
-    // Send the temporary password via email
+    // Use the first email account in the array as the sender
+    const senderEmail = emailAccounts[0].user;
+    const senderPass = emailAccounts[0].pass;
+
+    // Create the Nodemailer transporter
+    const transporter = createTransporter(senderEmail, senderPass);
+
+    // Define the email options
     const mailOptions = {
-        from: process.env.EMAIL_USER,
-        to: email,
+        from: `"Your App Name" <no-reply@yourapp.com>`, // Generic sender name and no-reply email
+        to: normalizedEmail, // Recipient email address (the one provided in the request)
         subject: "Password Reset",
         text: `Your temporary password is: ${tempPassword}. Please use this to login and change your password.`
     };
 
+    // Send the email
     transporter.sendMail(mailOptions, (error, info) => {
         if (error) {
             console.error("Error sending email:", error);
@@ -166,14 +191,30 @@ app.get("/download/:filename", (req, res) => {
 
 // Get Assignments for Dashboard (Student)
 app.get("/assignments", async (req, res) => {
-    const { email } = req.query;
-    const assignments = await Assignment.find({ email }).sort({ uploadTime: -1 });
+    const { email, subject } = req.query;
+    let query = { email };
+
+    // Add subject to the query if provided
+    if (subject) {
+        query.subject = subject;
+    }
+
+    const assignments = await Assignment.find(query).sort({ uploadTime: -1 });
+    console.log("Assignments Query Result:", assignments); // Debugging line
     res.json(assignments);
 });
 
 // Get All Assignments (Teacher)
 app.get("/all-assignments", checkRole("teacher"), async (req, res) => {
-    const assignments = await Assignment.find().sort({ uploadTime: -1 });
+    const { subject } = req.query;
+    let query = {};
+
+    // Add subject to the query if provided
+    if (subject) {
+        query.subject = subject;
+    }
+
+    const assignments = await Assignment.find(query).sort({ uploadTime: -1 });
     res.json(assignments);
 });
 
@@ -205,14 +246,54 @@ app.get("/notifications", async (req, res) => {
 app.post("/upload-text", async (req, res) => {
     const { email, subject, text } = req.body;
 
+    if (!text) return res.status(400).json({ message: "Assignment text is required" });
+
     const newAssignment = new Assignment({
         email,
-        text,
-        subject
+        text, // Ensure text is included
+        subject // Include subject
     });
 
     await newAssignment.save();
     res.json({ message: "Text assignment posted successfully" });
+});
+// Password Validation Function
+const validatePassword = (password) => {
+    const regex = /^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()])[A-Za-z\d!@#$%^&*()]{8,}$/;
+    return regex.test(password);
+};
+
+// Updated Register Route
+app.post("/register", async (req, res) => {
+    const { email, password, role } = req.body;
+
+    // Validate password
+    if (!validatePassword(password)) {
+        return res.status(400).json({ message: "Password must be at least 8 characters long, with one uppercase letter, one number, and one symbol." });
+    }
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) return res.status(400).json({ message: "User already exists" });
+
+    const newUser = new User({ email, password, role });
+    await newUser.save();
+    res.status(201).json({ message: "Registration successful" });
+});
+
+// Delete Assignment
+app.delete("/assignments/:id", async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const assignment = await Assignment.findByIdAndDelete(id);
+        if (!assignment) {
+            return res.status(404).json({ message: "Assignment not found" });
+        }
+        res.json({ message: "Assignment deleted successfully" });
+    } catch (error) {
+        console.error("Error deleting assignment:", error);
+        res.status(500).json({ message: "Failed to delete assignment", error: error.message });
+    }
 });
 
 // Start Server
